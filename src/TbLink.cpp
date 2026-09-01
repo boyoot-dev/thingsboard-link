@@ -66,6 +66,27 @@ void TbLink::begin(const TbMqttConfig& mqtt, const TbOtaConfig& ota) {
         mqttClient_.setClient(plainClient_);
     }
 
+    // PubSubClient::setSocketTimeout() only bounds *reads* (the CONNACK wait inside
+    // connect(), and loop()'s incoming-message wait) - it does NOT wrap subscribe()/
+    // publish(), which write() directly to the underlying Client. If the TCP/TLS
+    // socket dies without a clean close (observed in practice after several rapid
+    // reconnects), that write() can block indefinitely, wedging the entire single-
+    // threaded loop() - nothing else (heartbeat, RPC, telemetry) runs either. Setting
+    // the underlying Client's own timeout bounds every blocking Stream/Client
+    // operation, not just PubSubClient's read path.
+    //
+    // Deliberately NOT reusing socket_timeout_s (3s) here: that value is tuned for
+    // PubSubClient's post-TCP-connect CONNACK read, but this timeout also governs the
+    // TLS handshake itself inside secureClient_.connect() - mbedTLS's RSA/ECC
+    // operations on the ESP32 can legitimately take several seconds, and cutting that
+    // off at 3s turned a working connection into a fast, spurious failure (observed
+    // live: two consecutive state=-4 timeouts appeared the moment this was set to
+    // socket_timeout_s). 10s gives the handshake real headroom while still bounding a
+    // truly dead socket far below "hangs forever".
+    constexpr unsigned long kClientIoTimeoutMs = 10000;
+    plainClient_.setTimeout(kClientIoTimeoutMs);
+    secureClient_.setTimeout(kClientIoTimeoutMs);
+
     // PubSubClient::setServer() stores the raw pointer rather than copying the
     // hostname, so it must outlive every call that uses it - mqttCfg_ is a member,
     // stable for this object's lifetime, so this is safe as long as mqttCfg_.host is
@@ -144,11 +165,25 @@ bool TbLink::connected() { return mqttClient_.connected(); }
 void TbLink::onReconnected() {
     Serial.println("TbLink: connected to ThingsBoard");
 
+    // Matches the ThingsBoard Arduino SDK's own convention (telemetry, not an
+    // attribute) so the device page's history actually reflects what's really
+    // running, independent of whatever OTA package is currently assigned - this is
+    // the only source of truth for "what version actually booted", since fw_state/
+    // fw_title/fw_version under Shared Attributes only describe the *target*.
+    if (otaCfg_.current_fw_title.length() > 0) {
+        sendTelemetry("current_fw_title", otaCfg_.current_fw_title.c_str());
+    }
+    if (otaCfg_.current_fw_version.length() > 0) {
+        sendTelemetry("current_fw_version", otaCfg_.current_fw_version.c_str());
+    }
+
     lock();
-    mqttClient_.subscribe("v1/devices/me/rpc/request/+");
-    mqttClient_.subscribe("v1/devices/me/attributes");
-    mqttClient_.subscribe("v1/devices/me/attributes/response/+");
+    bool subRpc = mqttClient_.subscribe("v1/devices/me/rpc/request/+");
+    bool subAttr = mqttClient_.subscribe("v1/devices/me/attributes");
+    bool subAttrResp = mqttClient_.subscribe("v1/devices/me/attributes/response/+");
     unlock();
+    Serial.printf("TbLink: subscribe results - rpc=%d attributes=%d attributes/response=%d\n",
+                  subRpc, subAttr, subAttrResp);
 
     for (size_t i = 0; i < kMaxAttributeWatches; i++) {
         AttributeWatch& watch = attributeWatches_[i];
@@ -172,6 +207,7 @@ void TbLink::onReconnected() {
 
 void TbLink::handleMessage(char* topic, uint8_t* payload, unsigned int length) {
     String topicStr(topic);
+    Serial.printf("TbLink: message on '%s' (%u bytes)\n", topic, length);
 
     StaticJsonDocument<512> doc;
     DeserializationError err = deserializeJson(doc, payload, length);
@@ -216,25 +252,34 @@ void TbLink::handleAttributesMessage(const JsonDocument& doc) {
             start = comma + 1;
         }
 
-        if (updated && watch.onComplete) {
-            watch.onComplete(watch.cache);
+        if (updated) {
+            String cacheStr;
+            serializeJson(watch.cache, cacheStr);
+            Serial.printf("TbLink: attribute watch %u updated, cache now: %s\n",
+                          (unsigned)i, cacheStr.c_str());
+            if (watch.onComplete) {
+                watch.onComplete(watch.cache);
+            }
         }
     }
 }
 
 void TbLink::handleRpcMessage(const String& topic, const JsonDocument& doc) {
-    if (!rpcHandler_) {
-        return;
-    }
     const char* method = doc["method"];
     if (!method) {
         Serial.println("TbLink: RPC message missing 'method' field");
+        return;
+    }
+    if (!rpcHandler_) {
+        Serial.printf("TbLink: RPC method '%s' received but no onRpc() handler registered\n",
+                      method);
         return;
     }
     JsonVariantConst params = doc["params"];
 
     StaticJsonDocument<256> response;
     bool handled = rpcHandler_(String(method), params, response);
+    Serial.printf("TbLink: RPC method '%s' -> handled=%d\n", method, handled);
     if (!handled) {
         return;
     }

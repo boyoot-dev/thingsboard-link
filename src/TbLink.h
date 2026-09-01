@@ -75,6 +75,8 @@ struct TbOtaConfig {
                                       // string equality — must match ThingsBoard's
                                       // package version string byte-for-byte,
                                       // including any prefix and case
+    String current_fw_title;         // published as-is (see below) - purely
+                                      // informational, not compared against anything
     String expected_fw_title;        // if non-empty, an assigned package whose
                                       // fw_title doesn't match this is silently
                                       // ignored (logged, not downloaded) rather than
