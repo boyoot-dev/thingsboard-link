@@ -7,6 +7,22 @@ Extracted from two real projects — `esp32-mqtt-generic-board` and `ESP32_Alarm
 that independently hit and solved the same problems against the same server. This library
 exists so the third project doesn't have to solve them a third time.
 
+## Using it from PlatformIO
+
+Pin a commit in `lib_deps`:
+
+```ini
+lib_deps =
+    https://github.com/boyoot-dev/thingsboard-link.git#640d10a
+```
+
+PlatformIO caches a git dependency in `.pio/libdeps` and does not fetch it again for an
+unpinned URL, so a project keeps building against whatever TbLink it downloaded first.
+After pushing a TbLink change, bump the hash in each project that needs it. The first
+build after a bump can fail while PlatformIO swaps the cached copy; build again. To work
+on TbLink and a project together, use `symlink://../TbLink` temporarily and switch back
+to the pinned URL once TbLink is pushed.
+
 ## Why not the ThingsBoard C++ SDK?
 
 `esp32-mqtt-generic-board` used it first and it worked well there — but the two projects
