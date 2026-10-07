@@ -109,8 +109,15 @@ void TbLink::begin(const TbMqttConfig& mqtt, const TbOtaConfig& ota) {
 }
 
 void TbLink::loop() {
-    if (otaUpdatePending_) {
+    if (otaUpdatePending_ && otaGate_ && !otaGate_()) {
+        if (!otaGateLogged_) {
+            otaGateLogged_ = true;
+            Serial.printf("TbLink: firmware %s is waiting for the app to allow installing\n",
+                          pendingOtaVersion_.c_str());
+        }
+    } else if (otaUpdatePending_) {
         otaUpdatePending_ = false;
+        otaGateLogged_ = false;
         // Deferred here (rather than acted on directly inside the MQTT callback that
         // detected it) because performOtaUpdate() may need to disconnect the MQTT
         // client to free heap for a second TLS session, and that can't safely happen
@@ -158,6 +165,10 @@ void TbLink::loop() {
         lastHeartbeat_ = now;
         sendTelemetry(mqttCfg_.heartbeat_key.c_str(), true);
     }
+    if (mqttCfg_.attribute_refresh_interval_ms > 0 &&
+        now - lastAttributeRefresh_ >= mqttCfg_.attribute_refresh_interval_ms) {
+        refreshSharedAttributes();
+    }
 }
 
 bool TbLink::connected() { return mqttClient_.connected(); }
@@ -185,20 +196,7 @@ void TbLink::onReconnected() {
     Serial.printf("TbLink: subscribe results - rpc=%d attributes=%d attributes/response=%d\n",
                   subRpc, subAttr, subAttrResp);
 
-    for (size_t i = 0; i < kMaxAttributeWatches; i++) {
-        AttributeWatch& watch = attributeWatches_[i];
-        if (!watch.active) {
-            continue;
-        }
-        StaticJsonDocument<128> req;
-        req["sharedKeys"] = watch.keysCsv;
-        char buf[128];
-        size_t n = serializeJson(req, buf, sizeof(buf));
-        String topic = "v1/devices/me/attributes/request/" + String(i + 1);
-        lock();
-        mqttClient_.publish(topic.c_str(), (const uint8_t*)buf, n);
-        unlock();
-    }
+    refreshSharedAttributes();
 
     // Fire the heartbeat immediately on this connect rather than waiting a full
     // interval, same wraparound-safe idiom as lastReconnectAttempt_ above.
@@ -217,7 +215,21 @@ void TbLink::handleMessage(char* topic, uint8_t* payload, unsigned int length) {
         return;
     }
 
-    if (topicStr.startsWith("v1/devices/me/attributes")) {
+    static const char kResponsePrefix[] = "v1/devices/me/attributes/response/";
+    if (topicStr.startsWith(kResponsePrefix)) {
+        // A response carries every requested key that is currently set, so it replaces
+        // that watch's cache: a key missing from it (e.g. firmware unassigned) is gone.
+        size_t index = topicStr.substring(sizeof(kResponsePrefix) - 1).toInt() - 1;
+        if (index < kMaxAttributeWatches) {
+            attributeWatches_[index].cache.clear();
+            if (index == kOtaWatchIndex && otaUpdatePending_ &&
+                doc["shared"]["fw_version"].isNull()) {
+                Serial.println("TbLink: firmware no longer assigned - dropping waiting update");
+                otaUpdatePending_ = false;
+            }
+        }
+        handleAttributesMessage(doc);
+    } else if (topicStr.startsWith("v1/devices/me/attributes")) {
         handleAttributesMessage(doc);
     } else if (topicStr.startsWith("v1/devices/me/rpc/request/")) {
         handleRpcMessage(topicStr, doc);
@@ -317,14 +329,7 @@ bool TbLink::requestSharedAttributes(std::initializer_list<const char*> keys,
         // If already connected, request now; otherwise onReconnected() will request
         // it (along with every other active watch) on the next successful connect.
         if (mqttClient_.connected()) {
-            StaticJsonDocument<128> req;
-            req["sharedKeys"] = watch.keysCsv;
-            char buf[128];
-            size_t n = serializeJson(req, buf, sizeof(buf));
-            String topic = "v1/devices/me/attributes/request/" + String(i + 1);
-            lock();
-            mqttClient_.publish(topic.c_str(), (const uint8_t*)buf, n);
-            unlock();
+            requestWatch(i);
         }
         return true;
     }
@@ -332,8 +337,39 @@ bool TbLink::requestSharedAttributes(std::initializer_list<const char*> keys,
     return false;
 }
 
+void TbLink::requestWatch(size_t index) {
+    StaticJsonDocument<128> req;
+    req["sharedKeys"] = attributeWatches_[index].keysCsv;
+    char buf[128];
+    size_t n = serializeJson(req, buf, sizeof(buf));
+    String topic = "v1/devices/me/attributes/request/" + String(index + 1);
+    lock();
+    mqttClient_.publish(topic.c_str(), (const uint8_t*)buf, n);
+    unlock();
+}
+
+void TbLink::refreshSharedAttributes() {
+    lastAttributeRefresh_ = millis();
+    if (!mqttClient_.connected()) {
+        return;  // onReconnected() requests them all anyway
+    }
+    for (size_t i = 0; i < kMaxAttributeWatches; i++) {
+        if (attributeWatches_[i].active) {
+            requestWatch(i);
+        }
+    }
+}
+
 void TbLink::onRpc(RpcHandler handler) { rpcHandler_ = handler; }
 void TbLink::onOtaResult(OtaResultHandler handler) { otaResultHandler_ = handler; }
+void TbLink::onOtaGate(OtaGate gate) { otaGate_ = gate; }
+
+String TbLink::pendingOtaVersion() {
+    lock();
+    String v = otaUpdatePending_ ? pendingOtaVersion_ : String();
+    unlock();
+    return v;
+}
 
 void TbLink::lock() {
     if (netLock_) {
@@ -416,7 +452,8 @@ void TbLink::checkOtaAttributes(const JsonDocument& merged) {
     }
 
     if (otaCfg_.current_fw_version == version) {
-        return;  // already on this version
+        otaUpdatePending_ = false;  // already on it; also drops a gated update whose
+        return;                     // assignment was rolled back meanwhile
     }
 
     if (otaCfg_.expected_fw_title.length() > 0 && otaCfg_.expected_fw_title != title) {
@@ -430,10 +467,12 @@ void TbLink::checkOtaAttributes(const JsonDocument& merged) {
         return;
     }
 
-    if (otaUpdatePending_) {
-        return;  // already queued from an earlier attribute update
+    if (otaUpdatePending_ && pendingOtaVersion_ == version) {
+        return;  // already queued (a periodic refresh re-sends the same package)
     }
 
+    // A newer assignment replaces one still waiting for the gate.
+    otaGateLogged_ = false;
     Serial.printf("TbLink: new firmware available - current=%s target=%s\n",
                    otaCfg_.current_fw_version.c_str(), version);
     pendingOtaTitle_ = title;

@@ -75,10 +75,20 @@ testing, a device could sit on stale attribute values indefinitely with zero err
 one thing that reliably works is requesting the full set fresh on every new MQTT
 connection. `TbLink::onReconnected()` does this automatically for every active
 `AttributeWatch` (including the built-in OTA one), so a firmware package assigned while a
-device is offline is picked up the moment it reconnects, without needing a periodic
-poll — though a project with tighter hands-off-rollout requirements may still want to
-force a periodic reconnect (e.g. a scheduled reboot) rather than relying on the device
-naturally reconnecting soon.
+device is offline is picked up the moment it reconnects. For a device that stays
+connected for weeks, set `TbMqttConfig::attribute_refresh_interval_ms` (e.g. 30 min) to
+re-request every watch periodically, or call `refreshSharedAttributes()` on demand (e.g.
+from a "check for updates" RPC). Each refresh re-fires the watch handlers with the same
+values, so keep them idempotent.
+
+## Choosing when an update installs
+
+Installing firmware ends in a restart. If that restart matters (relays, running
+equipment), register `onOtaGate()`: TbLink then holds a newly seen package and asks the
+gate on every `loop()` whether it may install now — e.g. only inside a night-time window,
+or only after a user clicks "install". `pendingOtaVersion()` reports what is waiting. A
+newer assignment replaces the waiting one, and re-assigning the running version drops
+it. A failed download is retried on the next attribute refresh.
 
 ## Not included (by design)
 

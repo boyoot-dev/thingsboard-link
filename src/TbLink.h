@@ -57,6 +57,13 @@ struct TbMqttConfig {
                                       // client-side offline-staleness thresholds
                                       // downstream should be roughly 3x this
     String heartbeat_key = "heartbeat";
+    unsigned long attribute_refresh_interval_ms = 0;  // re-request every watched
+                                      // shared attribute this often while connected
+                                      // (0 = only on reconnect). ThingsBoard doesn't
+                                      // reliably push a newly assigned firmware
+                                      // package to a connected device (see README),
+                                      // so without this an update waits for the next
+                                      // reconnect.
 };
 
 struct TbOtaConfig {
@@ -108,6 +115,12 @@ public:
     // every call has everything.
     using AttributesHandler = std::function<void(const JsonDocument& merged)>;
 
+    // Asked from loop() while a new firmware package is waiting; return true to
+    // download and install it now (the device restarts at the end). Returning false
+    // keeps it waiting and asks again on the next loop(). Without a gate an update
+    // installs as soon as it is seen.
+    using OtaGate = std::function<bool()>;
+
     void begin(const TbMqttConfig& mqtt, const TbOtaConfig& ota);
 
     // Call every loop() iteration. Non-blocking except for the bounded
@@ -135,8 +148,16 @@ public:
     bool requestSharedAttributes(std::initializer_list<const char*> keys,
                                   AttributesHandler onComplete);
 
+    // Re-requests every watched shared attribute now (e.g. from a "check for
+    // updates" RPC), instead of waiting for attribute_refresh_interval_ms.
+    void refreshSharedAttributes();
+
     void onRpc(RpcHandler handler);
     void onOtaResult(OtaResultHandler handler);
+    void onOtaGate(OtaGate gate);
+
+    // Version of the firmware package waiting for the gate, or "" if none.
+    String pendingOtaVersion();
 
     // For app code that needs to publish outside TbLink's own helpers (e.g. a web
     // server task touching shared state). TbLink's own methods already take this
@@ -160,6 +181,7 @@ private:
     void handleAttributesMessage(const JsonDocument& doc);
     void handleRpcMessage(const String& topic, const JsonDocument& doc);
     void onReconnected();
+    void requestWatch(size_t index);
     void checkOtaAttributes(const JsonDocument& merged);
     void performOtaUpdate(const String& title, const String& version,
                            const String& checksum, const String& checksumAlgorithm);
@@ -180,12 +202,15 @@ private:
 
     unsigned long lastReconnectAttempt_ = 0;
     unsigned long lastHeartbeat_ = 0;
+    unsigned long lastAttributeRefresh_ = 0;
 
     AttributeWatch attributeWatches_[kMaxAttributeWatches];
     static constexpr size_t kOtaWatchIndex = 0;  // reserved at begin()
 
     RpcHandler rpcHandler_;
     OtaResultHandler otaResultHandler_;
+    OtaGate otaGate_;
+    bool otaGateLogged_ = false;
 
     volatile bool otaUpdatePending_ = false;
     String pendingOtaTitle_, pendingOtaVersion_, pendingOtaChecksum_, pendingOtaChecksumAlgorithm_;
